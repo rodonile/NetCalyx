@@ -14,11 +14,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! # Kafka YANG Consumer Example
+//! # Kafka YANG Consumer
 //!
-//! This example demonstrates how to consume YANG-encoded telemetry messages
-//! from Kafka and validate them against YANG schemas stored in a Schema
-//! Registry.
+//! This binary consumes YANG-encoded telemetry messages from Kafka and
+//! validates them against YANG schemas stored in a Schema Registry.
 //!
 //! ## Features
 //!
@@ -58,11 +57,40 @@ shadow!(build);
 // CLI Arguments
 // ============================================================================
 
+/// Builds the multi-line version/build info string
+fn version_info() -> String {
+    format!(
+        "{}\n  \
+         Commit:      {} ({})\n  \
+         Branch/Tag:  {} / {}\n  \
+         Build Time:  {}\n  \
+         Rust:        {} ({})\n  \
+         OS:          {}",
+        build::PKG_VERSION,
+        build::COMMIT_HASH,
+        build::COMMIT_DATE,
+        build::BRANCH,
+        build::TAG,
+        build::BUILD_TIME,
+        build::RUST_VERSION,
+        build::BUILD_RUST_CHANNEL,
+        build::BUILD_OS,
+    )
+}
+
 /// Kafka YANG message consumer with Schema Registry validation
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    about,
+    long_about = None,
+    disable_version_flag = true,
+    version = version_info()
+)]
 struct Args {
-    /// Librdkafka config file (json)
+    /// Librdkafka config file (json).
+    ///
+    /// Entries are passed directly to librdkafka as key/value properties, see:
+    /// <https://github.com/confluentinc/librdkafka/blob/master/CONFIGURATION.md>
     #[arg(short = 'c', long)]
     config_file: Option<std::path::PathBuf>,
 
@@ -109,6 +137,10 @@ struct Args {
     /// interrupted/terminated
     #[arg(short = 'f', long = "follow")]
     follow: bool,
+
+    /// Print version and build information, then exit
+    #[arg(long, short = 'V', action = clap::ArgAction::Version)]
+    version: Option<bool>,
 }
 
 // ============================================================================

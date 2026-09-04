@@ -34,6 +34,7 @@ use netcalyx_bmp_service::supervisor::BmpSupervisorHandle;
 use netcalyx_flow_pkt::FlowInfo;
 use netcalyx_flow_service::FlowRequest;
 use netcalyx_flow_service::flow_supervisor::FlowCollectorsSupervisorActorHandle;
+use netcalyx_netconf_proto::yang_module_cache::YangModuleCache;
 use netcalyx_udp_notif_pkt::raw::MediaType;
 use netcalyx_udp_notif_service::UdpNotifRequest;
 use netcalyx_udp_notif_service::supervisor::UdpNotifSupervisorHandle;
@@ -180,16 +181,16 @@ pub async fn init_flow_collection(
                         }
                     }
 
-                    let (flow_recv, _) = supervisor_handle
-                        .subscribe(publisher_config.buffer_size)
-                        .await?;
-
                     if let Some(enrichment_config) = publisher_config.enrichment.as_ref() {
                         if let Some(flow_options_config) = enrichment_config
                             .inputs
                             .as_ref()
                             .and_then(|i| i.flow_options.as_ref())
                         {
+                            let (flow_recv, _) = supervisor_handle
+                                .subscribe(publisher_config.buffer_size)
+                                .await?;
+
                             let (flow_options_join, flow_options_handle) =
                                 FlowOptionsActorHandle::from_config(
                                     flow_options_config,
@@ -279,16 +280,16 @@ pub async fn init_flow_collection(
                         }
                     }
 
-                    let (flow_recv, _) = supervisor_handle
-                        .subscribe(publisher_config.buffer_size)
-                        .await?;
-
                     if let Some(enrichment_config) = publisher_config.enrichment.as_ref() {
                         if let Some(flow_options_config) = enrichment_config
                             .inputs
                             .as_ref()
                             .and_then(|i| i.flow_options.as_ref())
                         {
+                            let (flow_recv, _) = supervisor_handle
+                                .subscribe(publisher_config.buffer_size)
+                                .await?;
+
                             let (flow_options_join, flow_options_handle) =
                                 FlowOptionsActorHandle::from_config(
                                     flow_options_config,
@@ -556,12 +557,14 @@ pub async fn init_udp_notif_collection(
 
     // Only one schema cache is needed for all publishers
     let cache_location: PathBuf = udp_notif_config.cache_location.into();
-    let netconf_fetcher = netconf_fetcher(&udp_notif_config.netconf)?;
+    let global_module_cache = YangModuleCache::new();
+    let netconf_fetcher = netconf_fetcher(&udp_notif_config.netconf, global_module_cache.clone())?;
     let (_schema_join, schema_handle) = CacheActorHandle::new(
         10000,
         either::Right(cache_location),
         netconf_fetcher,
         Duration::from_mins(5),
+        global_module_cache,
         either::Left(meter.clone()),
     )?;
 
@@ -619,6 +622,7 @@ pub async fn init_udp_notif_collection(
                         publisher_config.buffer_size,
                         udp_notif_config.max_cached_packets_per_peer,
                         udp_notif_config.max_cached_packets_per_subscription,
+                        udp_notif_config.anydata_strict_validation,
                         udp_notif_recv.clone(),
                         validated_tx,
                         schema_handle.request_tx(),
@@ -694,6 +698,7 @@ pub async fn init_udp_notif_collection(
                         publisher_config.buffer_size,
                         udp_notif_config.max_cached_packets_per_peer,
                         udp_notif_config.max_cached_packets_per_subscription,
+                        udp_notif_config.anydata_strict_validation,
                         udp_notif_recv.clone(),
                         validated_tx,
                         schema_handle.request_tx(),
@@ -992,7 +997,10 @@ fn serialize_bmp(
     Ok((Some(key), value))
 }
 
-fn netconf_fetcher(config: &NetconfConfig) -> Result<NetconfYangLibraryFetcher, std::io::Error> {
+fn netconf_fetcher(
+    config: &NetconfConfig,
+    global_module_cache: YangModuleCache,
+) -> Result<NetconfYangLibraryFetcher, std::io::Error> {
     let user = &config.username;
     let private_key_path: PathBuf = (&config.private_key_path).into();
 
@@ -1021,6 +1029,7 @@ fn netconf_fetcher(config: &NetconfConfig) -> Result<NetconfYangLibraryFetcher, 
             config.max_retries,
             Duration::from_secs(config.max_backoff_secs),
         ),
+        global_module_cache,
     );
     Ok(fetcher)
 }

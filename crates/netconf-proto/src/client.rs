@@ -17,10 +17,11 @@
 use crate::capabilities::{Capability, NetconfVersion};
 use crate::codec::{SshCodec, SshCodecError};
 use crate::protocol::{
-    Filter, Hello, NetConfMessage, Rpc, RpcOperation, RpcReply, RpcReplyContent, RpcResponse,
-    WellKnownOperation, WellKnownRpcResponse, YangSchemaFormat,
+    Filter, GetSchemaFormat, Hello, NetConfMessage, Rpc, RpcOperation, RpcReply, RpcReplyContent,
+    RpcResponse, WellKnownOperation, WellKnownRpcResponse,
 };
 use crate::xml_utils::{ParsingError, XmlDeserialize};
+use crate::yang_module_cache::{ModuleFetch, YangModuleCache};
 use crate::yang_push::SUBSCRIBED_NOTIFICATIONS_NS;
 use crate::yang_push::filters::Filters;
 use crate::yang_push::subscription::{DatastoreSelectionFilterObjects, Subscription, Target};
@@ -153,10 +154,11 @@ pub struct NetconfSshConnectConfig<H> {
     /// to [`crate::codec::DEFAULT_MAX_MESSAGE_SIZE`], override with
     /// [`NetconfSshConnectConfig::with_max_message_size`].
     max_message_size: usize,
+    module_cache: YangModuleCache,
 }
 
 impl<H: russh::client::Handler> NetconfSshConnectConfig<H> {
-    pub const fn new(
+    pub fn new(
         auth: SshAuth,
         peer_address: SocketAddr,
         local_address: Option<SocketAddr>,
@@ -174,6 +176,7 @@ impl<H: russh::client::Handler> NetconfSshConnectConfig<H> {
             handler,
             config,
             max_message_size: crate::codec::DEFAULT_MAX_MESSAGE_SIZE,
+            module_cache: YangModuleCache::new(),
         }
     }
 
@@ -181,6 +184,11 @@ impl<H: russh::client::Handler> NetconfSshConnectConfig<H> {
     /// Defaults to [`crate::codec::DEFAULT_MAX_MESSAGE_SIZE`].
     pub const fn with_max_message_size(mut self, max_message_size: usize) -> Self {
         self.max_message_size = max_message_size;
+        self
+    }
+
+    pub fn with_module_cache(mut self, module_cache: YangModuleCache) -> Self {
+        self.module_cache = module_cache;
         self
     }
 
@@ -307,6 +315,7 @@ where
         stream,
         config.announce_caps,
         config.max_message_size,
+        config.module_cache,
     )
     .await
 }
@@ -334,6 +343,11 @@ pub struct NetConfSshClient<T> {
     /// making multiple requests to the device to get the filters when
     /// processing multiple subscriptions
     yang_push_filters: Option<Filters>,
+
+    /// Global YANG module cache shared across all sessions that use the same
+    /// [`YangModuleCache`] instance. Populated transparently by
+    /// [`get_yang_module`](Self::get_yang_module); callers see no difference.
+    module_cache: YangModuleCache,
 }
 
 impl<T> NetConfSshClient<T> {
@@ -361,6 +375,10 @@ impl<T> NetConfSshClient<T> {
 
     pub fn yang_library(&self) -> Option<Arc<YangLibrary>> {
         self.yang_library.as_ref().map(Arc::clone)
+    }
+
+    pub fn module_cache(&self) -> &YangModuleCache {
+        &self.module_cache
     }
 }
 
@@ -419,6 +437,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetConfSshClient<T> {
         stream: T,
         announce_caps: HashSet<Capability>,
         max_message_size: usize,
+        module_cache: YangModuleCache,
     ) -> Result<Self, NetConfSshClientError> {
         let framed = Framed::new(stream, SshCodec::with_max_message_size(max_message_size));
         let (framed, session_id, peer_caps) = Self::exchange_hello(framed, announce_caps).await?;
@@ -431,6 +450,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetConfSshClient<T> {
             next_message_id,
             yang_library: None,
             yang_push_filters: None,
+            module_cache,
         })
     }
 
@@ -503,20 +523,85 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetConfSshClient<T> {
         Ok(())
     }
 
-    /// Get YANG schema from the device
-    pub async fn get_schema(
+    /// Fetch a YANG module from the device via the NETCONF `get-schema` RPC,
+    /// consulting the shared module cache first.
+    ///
+    /// Caching requires a `version`: the shared cache is keyed by
+    /// `(name, revision)`, so only modules that carry a revision are cached.
+    /// When `version` is `Some`, a cache hit skips the RPC entirely and a miss
+    /// populates the cache for all future calls.  When `version` is `None` the
+    /// module is fetched straight from the device on every call, bypassing the
+    /// cache.
+    ///
+    /// Concurrent fetches of the same `(name, revision)` across sessions are
+    /// de-duplicated via [`YangModuleCache::begin_fetch`]: only one session
+    /// (the leader) issues the RPC while the others await its result. This is
+    /// sound because a given `(name, revision)` identifies stable content
+    /// regardless of which device served it ([RFC 7950] §11).
+    ///
+    /// [RFC 7950]: https://www.rfc-editor.org/rfc/rfc7950
+    pub async fn get_yang_module(
         &mut self,
         name: &str,
         version: Option<&str>,
-    ) -> Result<Box<str>, NetConfSshClientError> {
+    ) -> Result<Arc<str>, NetConfSshClientError> {
+        // Unversioned modules are never cached; fetch straight from the device.
+        let Some(version) = version else {
+            return self.fetch_module_rpc(name, None).await;
+        };
+
+        // `module_cache` is a cheap-to-clone handle; clone it so the fetch below
+        // can borrow `&mut self` without conflicting with the cache borrow.
+        let cache = self.module_cache.clone();
+        loop {
+            match cache.begin_fetch(name, version) {
+                ModuleFetch::Cached(cached) => {
+                    trace!(
+                        "[{}] yang module cache hit for `{name}` revision {version}",
+                        self.peer
+                    );
+                    return Ok(cached);
+                }
+                ModuleFetch::Wait(waiter) => {
+                    trace!(
+                        "[{}] awaiting in-flight fetch for `{name}` revision {version}",
+                        self.peer
+                    );
+                    if let Some(text) = waiter.wait().await {
+                        return Ok(text);
+                    }
+                    // The leader failed; retry — we become a new leader or waiter.
+                    debug!(
+                        "[{}] leader fetch for `{name}` revision {version} failed, retrying",
+                        self.peer
+                    );
+                }
+                ModuleFetch::Lead(lease) => {
+                    // We are the leader: perform the RPC. On success publish the
+                    // text to waiters; on error the lease drops, freeing them.
+                    let text = self.fetch_module_rpc(name, Some(version)).await?;
+                    lease.fulfil(Arc::clone(&text));
+                    return Ok(text);
+                }
+            }
+        }
+    }
+
+    /// Issue a `get-schema` RPC for `(name, version)` and return the raw module
+    /// text. This talks to the device directly and does not touch the cache.
+    async fn fetch_module_rpc(
+        &mut self,
+        name: &str,
+        version: Option<&str>,
+    ) -> Result<Arc<str>, NetConfSshClientError> {
         debug!(
-            "[{}] Getting a YANG schema with name `{name}` and version {version:?}",
+            "[{}] Getting a YANG module with name `{name}` and version {version:?}",
             self.peer
         );
         let rpc = RpcOperation::WellKnown(WellKnownOperation::GetSchema {
             identifier: name.into(),
             version: version.map(Into::into),
-            format: Some(YangSchemaFormat::Yang),
+            format: Some(GetSchemaFormat::Yang),
         });
         let message_id = self.rpc(rpc).await?;
         let rpc_reply = self.rpc_reply().await?;
@@ -532,7 +617,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetConfSshClient<T> {
             if let RpcResponse::WellKnown(WellKnownRpcResponse::YangSchema { schema }) =
                 rpc_response
             {
-                return Ok(schema);
+                return Ok(Arc::from(schema.as_ref()));
             } else {
                 unreachable!()
             }
@@ -637,7 +722,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetConfSshClient<T> {
             visited.insert(module.name().to_string());
 
             // Fetch the YANG schema
-            let schema = self.get_schema(module.name(), module.revision()).await?;
+            let schema = self
+                .get_yang_module(module.name(), module.revision())
+                .await?;
             // Parse dependencies from schema
             let deps = extract_yang_dependencies(&schema).map_err(|error| {
                 NetConfSshClientError::YangSchemaParsingError {
@@ -706,17 +793,22 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetConfSshClient<T> {
             match module {
                 ModuleType::Full(module) => {
                     builder
-                        .add_module(module, schema, checker)
+                        .add_module(module, Box::from(schema.as_ref()), checker)
                         .map_err(NetConfSshClientError::DependencyError)?;
                 }
                 ModuleType::FullSubmodule(module_name, submodule) => {
                     builder
-                        .add_submodule_for_module(module_name.as_ref(), submodule, schema, checker)
+                        .add_submodule_for_module(
+                            module_name.as_ref(),
+                            submodule,
+                            Box::from(schema.as_ref()),
+                            checker,
+                        )
                         .map_err(NetConfSshClientError::DependencyError)?;
                 }
                 ModuleType::ImportOnly(module) => {
                     builder
-                        .add_import_only_module(module, schema, checker)
+                        .add_import_only_module(module, Box::from(schema.as_ref()), checker)
                         .map_err(NetConfSshClientError::DependencyError)?;
                 }
                 ModuleType::ImportOnlySubmodule(module_name, submodule) => {
@@ -724,7 +816,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetConfSshClient<T> {
                         .add_submodule_for_import_only_module(
                             module_name.as_ref(),
                             submodule,
-                            schema,
+                            Box::from(schema.as_ref()),
                             checker,
                         )
                         .map_err(NetConfSshClientError::DependencyError)?;
@@ -755,10 +847,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetConfSshClient<T> {
         if let Some(RpcResponse::WellKnown(WellKnownRpcResponse::Data(data))) =
             rpc_reply.reply().responses()
         {
+            trace!("[{}] Raw <get> response for filters: `{data}`", self.peer);
+
             let mut reader = NsReader::from_str(data);
             reader.config_mut().trim_text(true);
             let mut parser = crate::xml_utils::XmlParser::new(reader)?;
             let filters = Filters::xml_deserialize(&mut parser)?;
+
+            trace!("[{}] Parsed filters: {filters:?}", self.peer);
             return Ok(filters);
         }
         Err(NetConfSshClientError::UnexpectedMessage {
@@ -792,6 +888,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetConfSshClient<T> {
         if let Some(RpcResponse::WellKnown(WellKnownRpcResponse::Data(data))) =
             rpc_reply.reply().responses()
         {
+            trace!(
+                "[{}] Raw <get> response for subscription {id}: `{data}`",
+                self.peer
+            );
             // Parse the response streams if any returned, filters if any returned
             // and then the subscription details
             let mut reader = NsReader::from_str(data);
@@ -801,6 +901,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetConfSshClient<T> {
             {
                 parser.open(Some(SUBSCRIBED_NOTIFICATIONS_NS), "subscriptions")?;
                 let mut subscription = Subscription::xml_deserialize(&mut parser)?;
+                trace!(
+                    "[{}] Parsed subscription {id} before target-by-reference resolution: {subscription:?}",
+                    self.peer
+                );
                 if let Target::Datastore(datastore_target) = &mut subscription.target
                     && let DatastoreSelectionFilterObjects::ByReference(name) =
                         &datastore_target.selection
@@ -818,6 +922,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NetConfSshClient<T> {
                     }
                 }
                 parser.close()?;
+                trace!(
+                    "[{}] Final subscription {id}: target={:?} module_version={:?} yang_library_content_id={:?}",
+                    self.peer,
+                    subscription.target,
+                    subscription.module_version,
+                    subscription.yang_library_content_id
+                );
                 subscription
             } else {
                 return Err(NetConfSshClientError::ParsingError(
